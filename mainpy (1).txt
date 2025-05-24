@@ -1,0 +1,1834 @@
+import discord
+from discord import app_commands, ui, ButtonStyle, File, Interaction, Embed, Message, Attachment
+import os
+import asyncio
+import random
+from datetime import datetime, timedelta, timezone
+import json
+import aiohttp
+import threading
+from io import BytesIO
+import re
+import time as time_module # time modülünü time_module olarak alıyoruz, çakışmayı önlemek için
+import math
+import logging
+import platform
+from PIL import Image
+from urllib.parse import urlparse, quote, unquote
+from dotenv import load_dotenv
+
+# PDF işleme için
+try:
+    from pypdf2 import PdfReader
+except ImportError:
+    PdfReader = None # Eğer kurulu değilse hata vermesin, komut içinde kontrol edilsin
+
+import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold, GenerationConfig
+
+# FastAPI (Health Check için)
+from fastapi import FastAPI
+import uvicorn
+
+# --- Ortam Değişkenlerini Yükle ---
+load_dotenv()
+
+# --- Temel Loglama Ayarları ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
+logger = logging.getLogger('discord_bot')
+
+# --- Discord Bot Ayarları ---
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.reactions = True
+# intents.voice_states = True # Müzik kaldırıldığı için buna gerek kalmayabilir, ama bazı VC işlemleri için kalabilir. Şimdilik bırakıyorum.
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+# --- FastAPI Uygulaması (Health Check için) ---
+fastapi_app = FastAPI() # 'app' yerine 'fastapi_app' kullanarak olası çakışmaları önle
+
+@fastapi_app.get("/")
+async def root():
+    return {"message": f"{BOT_NAME} Aktif! Versiyon: {VERSION}"}
+
+# --- Global Değişkenler ve Ayarlar ---
+PREFIX = "."
+BOT_NAME = "OmniVerse AI"
+VERSION = "1.0 BETA"
+DEVELOPER_IDS = [YOUR_DEVELOPER_USER_ID_HERE] # Kendi Discord kullanıcı ID'nizi buraya ekleyin (int olarak)
+
+# API Anahtarları
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TENOR_API_KEY = os.environ.get("TENOR_API_KEY") # GIF'ler için
+
+# Dosya Yolları
+USER_DATA_FILE = "user_data.json"
+PREMIUM_DATA_FILE = "premium.json"
+LANGUAGES_FILE = "languages.json"
+GUILD_PERSONALITIES_FILE = "guild_personalities.json" # Sunucuya özel kişilikler için
+
+# Veri Saklama Değişkenleri
+user_data = {}
+premium_users = {}
+language_strings = {}
+guild_personalities = {}
+
+# Emoji Yönetimi
+EMOJIS = {
+    "loading": "🔄",
+    "success": "✅",
+    "error": "❌",
+    "info": "ℹ️",
+    "credit": "🪙",
+    "premium": "⭐",
+    "ai": "🤖",
+    "link": "🔗",
+    "file": "📄",
+    "image": "🖼️",
+    "pdf": "📜",
+    "txt": "📝",
+    "wait": "⏳",
+    "party": "🎉",
+    "warning": "⚠️",
+    "question": "❓",
+    "translate": "🌐",
+    "summarize": "📋",
+    "analyze": "📊",
+    "game": "🎮",
+    "flag_en": "🇬🇧", "flag_tr": "🇹🇷", "flag_fr": "🇫🇷", "flag_de": "🇩🇪", "flag_es": "🇪🇸",
+    "flag_ar": "🇸🇦", "flag_ja": "🇯🇵", "flag_zh": "🇨🇳", "flag_ru": "🇷🇺", "flag_pt": "🇵🇹",
+    "flag_it": "🇮🇹", "flag_ko": "🇰🇷", "flag_hi": "🇮🇳", "flag_nl": "🇳🇱", "flag_pl": "🇵🇱",
+}
+
+SUPPORTED_LANGUAGES = {
+    "en": {"name": "English", "flag": EMOJIS["flag_en"]},
+    "tr": {"name": "Türkçe", "flag": EMOJIS["flag_tr"]},
+    "fr": {"name": "Français", "flag": EMOJIS["flag_fr"]},
+    "de": {"name": "Deutsch", "flag": EMOJIS["flag_de"]},
+    "es": {"name": "Español", "flag": EMOJIS["flag_es"]},
+    "ar": {"name": "العربية", "flag": EMOJIS["flag_ar"]},
+    "ja": {"name": "日本語", "flag": EMOJIS["flag_ja"]},
+    "zh-CN": {"name": "简体中文", "flag": EMOJIS["flag_zh"]}, # Çince (Basitleştirilmiş)
+    "ru": {"name": "Русский", "flag": EMOJIS["flag_ru"]},
+    "pt-BR": {"name": "Português (Brasil)", "flag": EMOJIS["flag_pt"]}, # Portekizce (Brezilya)
+    "it": {"name": "Italiano", "flag": EMOJIS["flag_it"]},
+    "ko": {"name": "한국어", "flag": EMOJIS["flag_ko"]},
+    "hi": {"name": "हिन्दी", "flag": EMOJIS["flag_hi"]},
+    "nl": {"name": "Nederlands", "flag": EMOJIS["flag_nl"]},
+    "pl": {"name": "Polski", "flag": EMOJIS["flag_pl"]},
+}
+
+
+# --- Veri Yönetimi Fonksiyonları ---
+def load_json_data(filepath, default_data=None):
+    if default_data is None:
+        default_data = {}
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.warning(f"{filepath} bulunamadı, varsayılan veri ile oluşturuluyor.")
+        save_json_data(filepath, default_data)
+        return default_data
+    except json.JSONDecodeError:
+        logger.error(f"{filepath} dosyası bozuk. Varsayılan veri ile üzerine yazılacak.")
+        save_json_data(filepath, default_data) # Bozuksa üzerine yaz
+        return default_data
+
+def save_json_data(filepath, data):
+    try:
+        temp_filepath = f"{filepath}.tmp"
+        with open(temp_filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        os.replace(temp_filepath, filepath)
+    except Exception as e:
+        logger.error(f"{filepath} dosyası kaydedilemedi: {e}")
+
+def get_user_data_entry(user_id: int):
+    user_id_str = str(user_id)
+    if user_id_str not in user_data:
+        user_data[user_id_str] = {
+            "credits": 0, # Başlangıçta 0, ilk kredi verme fonksiyonu ile artırılacak
+            "last_daily_credit_timestamp": None,
+            "language": "en", # Varsayılan dil
+            "initial_credit_granted": False,
+            "personality_prompt": None, # Kullanıcıya özel AI kişiliği
+            "chat_personality_active": False
+        }
+        # Yeni kullanıcı için ilk krediyi ver
+        if not user_data[user_id_str]["initial_credit_granted"]:
+            user_data[user_id_str]["credits"] = 10
+            user_data[user_id_str]["initial_credit_granted"] = True
+            logger.info(f"Kullanıcı {user_id_str} için 10 başlangıç kredisi verildi.")
+        save_json_data(USER_DATA_FILE, user_data)
+    return user_data[user_id_str]
+
+def is_premium_user(user_id: int):
+    return str(user_id) in premium_users
+
+def get_guild_personality(guild_id: int):
+    guild_id_str = str(guild_id)
+    return guild_personalities.get(guild_id_str)
+
+# --- Dil Yönetimi ---
+def load_translations():
+    global language_strings
+    default_lang_data = {
+        "en": {
+            "error_generic": "An error occurred.",
+            "error_no_permission": "You do not have permission to use this command.",
+            "error_bot_no_permission": "I don't have the required permissions: `{permissions}`.",
+            "error_cooldown": "This command is on cooldown. Try again in **{seconds:.1f}s**.",
+            "error_not_enough_credits": f"{EMOJIS['credit']} You don't have enough credits (1 required). Current: {{user_credits}}.",
+            "credits_exhausted_message": f"{EMOJIS['error']} You've run out of credits! Your daily credits will reset soon.\n"
+                                         f"Alternatively, upgrade to {EMOJIS['premium']} **Premium** for **$4.99** for unlimited access: [Your Premium Purchase Link Here]\n"
+                                         f"Or, vote for us on Top.gg for extra credits: [Your Top.gg Vote Link Here]",
+            "command_cost_message": f"{EMOJIS['credit']} This command cost 1 credit. Remaining: {{user_credits}}.",
+            "daily_credits_granted": f"{EMOJIS['party']} You have received your **10** daily credits! Current: {{user_credits}}.",
+            "initial_credits_granted": f"{EMOJIS['party']} Welcome! You have received **10** initial credits!",
+            "ai_thinking": f"{EMOJIS['ai']} OmniVerse AI is thinking...",
+            "ai_response_delayed_free": f"{EMOJIS['wait']} (Free user delay: {{delay_seconds}}s)",
+            "tictactoe_vs_ai_win": f"{EMOJIS['party']} You beat OmniVerse AI and earned 1 {EMOJIS['credit']} credit!",
+            "language_set": f"{EMOJIS['success']} Your language has been set to **{{language_name}}**.",
+            "premium_command_title": f"{EMOJIS['premium']} OmniVerse AI Premium",
+            "premium_command_description": ("Unlock the full potential of OmniVerse AI!\n\n"
+                                           f"**Benefits:**\n"
+                                           f"- {EMOJIS['success']} Unlimited AI command usage (no credit limits).\n"
+                                           f"- {EMOJIS['success']} Faster AI response times.\n"
+                                           f"- {EMOJIS['success']} Access to exclusive premium-only features (coming soon).\n"
+                                           f"- {EMOJIS['success']} Priority support.\n\n"
+                                           f"Upgrade now for just **$4.99**!"),
+            "premium_command_link_text": "Click here to become a Premium User!",
+            "personality_set_success": f"{EMOJIS['success']} AI personality for direct mentions in this server has been updated. Use `/editpersonality disable` to turn it off.",
+            "personality_disabled_success": f"{EMOJIS['success']} Custom AI personality for direct mentions in this server has been disabled.",
+            "personality_no_active": "No active custom personality set for direct mentions in this server.",
+            "error_file_too_large": f"{EMOJIS['error']} The uploaded file is too large (Max: {{max_size_mb}}MB).",
+            "error_unsupported_file": f"{EMOJIS['error']} Unsupported file type: `{{file_type}}`. Supported: PDF, TXT.",
+            "error_pdf_read": f"{EMOJIS['error']} Could not read text from the PDF file.",
+            "command_analyzeuser_description": "Analyzes the recent chat messages of a user.",
+            "command_analyzechat_description": "Analyzes recent messages in the current channel.",
+            "command_summarize_description": "Summarizes text, links, or uploaded documents.",
+            "command_translate_description": "Translates text or content from images/links to a specified language.",
+            "command_analyzedocument_description": "Analyzes an uploaded document (PDF, TXT).",
+            "command_tictactoe_description": "Play Tic-Tac-Toe against AI or another user.",
+            "command_language_description": "Set your preferred language for bot responses.",
+            "command_premium_description": "Information about OmniVerse AI Premium.",
+            "command_editpersonality_description": "Edit the AI's personality for direct mentions in this server.",
+            "command_editpersonality_option_action_description": "Enable, disable, or view the current personality.",
+            "command_editpersonality_option_prompt_description": "The personality prompt for the AI (if enabling).",
+            # ... Diğer genel mesajlar
+        },
+        "tr": {
+            "error_generic": "Bir hata oluştu.",
+            "error_no_permission": "Bu komutu kullanma yetkiniz yok.",
+            "error_bot_no_permission": "Gerekli yetkilere sahip değilim: `{permissions}`.",
+            "error_cooldown": "Bu komut bekleme süresinde. **{seconds:.1f} saniye** sonra tekrar deneyin.",
+            "error_not_enough_credits": f"{EMOJIS['credit']} Yeterli krediniz yok (1 gerekli). Mevcut: {{user_credits}}.",
+            "credits_exhausted_message": f"{EMOJIS['error']} Kredileriniz tükendi! Günlük kredileriniz yakında yenilenecek.\n"
+                                         f"Alternatif olarak, sınırsız erişim için sadece **4.99$** karşılığında {EMOJIS['premium']} **Premium**'a yükseltin: [Premium Satın Alma Linkiniz Buraya]\n"
+                                         f"Veya ekstra kredi için Top.gg'de bize oy verin: [Top.gg Oy Verme Linkiniz Buraya]",
+            "command_cost_message": f"{EMOJIS['credit']} Bu komut 1 kredi harcadı. Kalan: {{user_credits}}.",
+            "daily_credits_granted": f"{EMOJIS['party']} **10** günlük krediniz verildi! Mevcut: {{user_credits}}.",
+            "initial_credits_granted": f"{EMOJIS['party']} Hoş geldiniz! **10** başlangıç krediniz verildi!",
+            "ai_thinking": f"{EMOJIS['ai']} OmniVerse AI düşünüyor...",
+            "ai_response_delayed_free": f"{EMOJIS['wait']} (Ücretsiz kullanıcı gecikmesi: {{delay_seconds}}s)",
+            "tictactoe_vs_ai_win": f"{EMOJIS['party']} OmniVerse AI'ı yendin ve 1 {EMOJIS['credit']} kredi kazandın!",
+            "language_set": f"{EMOJIS['success']} Diliniz **{{language_name}}** olarak ayarlandı.",
+            "premium_command_title": f"{EMOJIS['premium']} OmniVerse AI Premium",
+            "premium_command_description": ("OmniVerse AI'ın tüm potansiyelini açığa çıkarın!\n\n"
+                                           f"**Avantajlar:**\n"
+                                           f"- {EMOJIS['success']} Sınırsız AI komut kullanımı (kredi limiti yok).\n"
+                                           f"- {EMOJIS['success']} Daha hızlı AI yanıt süreleri.\n"
+                                           f"- {EMOJIS['success']} Özel premium özelliklere erişim (yakında).\n"
+                                           f"- {EMOJIS['success']} Öncelikli destek.\n\n"
+                                           f"Sadece **4.99$** karşılığında şimdi yükseltin!"),
+            "premium_command_link_text": "Premium Kullanıcı Olmak İçin Tıklayın!",
+            "personality_set_success": f"{EMOJIS['success']} Bu sunucudaki doğrudan etiketlemeler için AI kişiliği güncellendi. Kapatmak için `/editpersonality disable` kullanın.",
+            "personality_disabled_success": f"{EMOJIS['success']} Bu sunucudaki doğrudan etiketlemeler için özel AI kişiliği devre dışı bırakıldı.",
+            "personality_no_active": "Bu sunucudaki doğrudan etiketlemeler için aktif özel kişilik ayarı yok.",
+            "error_file_too_large": f"{EMOJIS['error']} Yüklenen dosya çok büyük (Maks: {{max_size_mb}}MB).",
+            "error_unsupported_file": f"{EMOJIS['error']} Desteklenmeyen dosya türü: `{{file_type}}`. Desteklenenler: PDF, TXT.",
+            "error_pdf_read": f"{EMOJIS['error']} PDF dosyasından metin okunamadı.",
+            "command_analyzeuser_description": "Bir kullanıcının son sohbet mesajlarını analiz eder.",
+            "command_analyzechat_description": "Mevcut kanaldaki son mesajları analiz eder.",
+            "command_summarize_description": "Metinleri, bağlantıları veya yüklenen belgeleri özetler.",
+            "command_translate_description": "Metinleri veya görsellerdeki/bağlantılardaki içeriği belirtilen bir dile çevirir.",
+            "command_analyzedocument_description": "Yüklenmiş bir belgeyi (PDF, TXT) analiz eder.",
+            "command_tictactoe_description": "AI'a veya başka bir kullanıcıya karşı Tic-Tac-Toe oynayın.",
+            "command_language_description": "Bot yanıtları için tercih ettiğiniz dili ayarlayın.",
+            "command_premium_description": "OmniVerse AI Premium hakkında bilgi.",
+            "command_editpersonality_description": "Bu sunucudaki doğrudan etiketlemeler için AI'nın kişiliğini düzenleyin.",
+            "command_editpersonality_option_action_description": "Mevcut kişiliği etkinleştirin, devre dışı bırakın veya görüntüleyin.",
+            "command_editpersonality_option_prompt_description": "AI için kişilik istemi (etkinleştiriyorsanız).",
+        }
+        # Diğer diller için de buraya eklenecek
+    }
+    loaded_strings = load_json_data(LANGUAGES_FILE, default_lang_data)
+    # Varsayılan verideki eksik dilleri veya anahtarları tamamla
+    for lang_code, default_translations in default_lang_data.items():
+        if lang_code not in loaded_strings:
+            loaded_strings[lang_code] = default_translations.copy()
+        else:
+            for key, value in default_translations.items():
+                if key not in loaded_strings[lang_code]:
+                    loaded_strings[lang_code][key] = value
+    language_strings = loaded_strings
+    save_json_data(LANGUAGES_FILE, language_strings)
+
+
+def get_lang_string(user_id: int, key: str, **kwargs):
+    data = get_user_data_entry(user_id)
+    lang_code = data.get("language", "en")
+
+    # Çince için özel durum, zh-CN veya zh-TW olabilir, zh ile eşleştir
+    if lang_code.startswith("zh") and lang_code not in language_strings:
+        if "zh-CN" in language_strings: lang_code = "zh-CN"
+        elif "zh-TW" in language_strings: lang_code = "zh-TW"
+
+    # Portekizce için özel durum
+    if lang_code.startswith("pt") and lang_code not in language_strings:
+        if "pt-BR" in language_strings: lang_code = "pt-BR"
+        elif "pt-PT" in language_strings: lang_code = "pt-PT"
+
+
+    translation = language_strings.get(lang_code, language_strings.get("en", {})).get(key)
+
+    if translation is None: # Eğer çeviri bulunamazsa İngilizceye fallback yap
+        translation = language_strings.get("en", {}).get(key, f"[{key.upper()}_NOT_FOUND]")
+
+    try:
+        return translation.format(**kwargs)
+    except KeyError as e_format: # Formatlama hatası olursa
+        logger.error(f"Dil formatlama hatası: Dil={lang_code}, Anahtar={key}, kwargs={kwargs}, Hata={e_format}")
+        return language_strings.get("en", {}).get(key, f"[{key.upper()}_FORMAT_ERROR]") # Hatalı format yerine İngilizce ham metni gönder
+    except Exception as e:
+        logger.error(f"Dil string getirme hatası: {e}")
+        return f"[{key.upper()}_ERROR]"
+
+def get_localized_description(key_base: str, lang_code: str):
+    """ Slash komut açıklamaları için yerelleştirilmiş string alır. """
+    # Bu fonksiyon, 'command_X_description' formatındaki anahtarları kullanır.
+    return language_strings.get(lang_code, {}).get(f"command_{key_base}_description", None)
+
+def get_all_localized_descriptions(key_base: str):
+    """ Tüm diller için yerelleştirilmiş açıklamaları döner. """
+    localizations = {}
+    for lang_code in SUPPORTED_LANGUAGES.keys():
+        desc = get_localized_description(key_base, lang_code)
+        if desc:
+            # Discord'un beklediği format: zh-CN, zh-TW, pt-BR
+            discord_lang_code = lang_code
+            localizations[discord_lang_code] = desc
+    return localizations if localizations else None
+
+# --- Gemini AI Yapılandırması ve Fonksiyonları ---
+gemini_model_instance = None
+KULLANILACAK_GEMINI_MODELI = 'gemini-1.5-flash-latest' # Veya 'gemini-pro' (metin), 'gemini-pro-vision' (multimodal)
+
+DEFAULT_GEMINI_SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+}
+
+# Kişilik modu için daha esnek ayarlar (sunucu sahibi tarafından belirlenen kişilik için)
+PERSONALITY_MODE_SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+}
+
+DEFAULT_GENERATION_CONFIG = GenerationConfig(
+    # temperature=0.7, # Yaratıcılık ayarı, isteğe bağlı
+    max_output_tokens=2000 # Yanıt uzunluğu için token limiti
+)
+
+if GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model_instance = genai.GenerativeModel(
+            KULLANILACAK_GEMINI_MODELI,
+            # safety_settings ve generation_config generate_content_async içinde dinamik olarak verilecek
+        )
+        logger.info(f"Google Gemini AI ({KULLANILACAK_GEMINI_MODELI}) başarıyla yüklendi.")
+    except Exception as e:
+        logger.error(f"Google Gemini AI yapılandırma hatası ({KULLANILACAK_GEMINI_MODELI}): {e}")
+        gemini_model_instance = None
+else:
+    logger.warning("GEMINI_API_KEY ortam değişkeni bulunamadı. AI özellikleri devre dışı.")
+
+
+async def ask_gemini_core(
+    prompt_parts: list, # Hem metin hem de Image objeleri içerebilir
+    user_id: int,
+    target_language_code: str = "en",
+    apply_guild_chat_personality: bool = False, # Sadece mention sohbetlerinde aktif olacak sunucu kişiliği
+    guild_id: int | None = None
+):
+    if not gemini_model_instance:
+        return get_lang_string(user_id, "error_ai_module_unavailable", ai_name="Gemini")
+
+    user_is_premium = is_premium_user(user_id)
+    delay_seconds = 1.25 if user_is_premium else 3.5
+    await asyncio.sleep(delay_seconds)
+
+    current_safety_settings = DEFAULT_GEMINI_SAFETY_SETTINGS
+    personality_system_prompt = f"You are {BOT_NAME}, a helpful AI assistant. You will never say you are a language model or an AI model by Google or OpenAI."
+    
+    # Sunucuya özel kişilik (sadece mention sohbetleri için)
+    if apply_guild_chat_personality and guild_id:
+        g_personality_data = get_guild_personality(guild_id)
+        if g_personality_data and g_personality_data.get("active") and g_personality_data.get("prompt"):
+            personality_system_prompt += f"\n\nSERVER-SPECIFIC PERSONALITY INSTRUCTION (Strictly Follow This for this interaction only):\n{g_personality_data['prompt']}\n(End of server-specific instruction)"
+            current_safety_settings = PERSONALITY_MODE_SAFETY_SETTINGS # Kişilik için daha esnek güvenlik
+            logger.info(f"Guild personality active for user {user_id} in guild {guild_id}.")
+
+
+    # Dil talimatı
+    target_language_name = SUPPORTED_LANGUAGES.get(target_language_code, {}).get("name", "English")
+    language_instruction = f"\nIMPORTANT: Respond in {target_language_name} (language code: {target_language_code})."
+    personality_system_prompt += language_instruction
+
+    # API'ye gönderilecek son prompt parçaları
+    final_api_prompt_parts = [personality_system_prompt]
+
+    # Kullanıcının asıl prompt'unu ve resimlerini ekle
+    has_text_input = False
+    for part in prompt_parts:
+        if isinstance(part, str) and part.strip():
+            final_api_prompt_parts.append(part)
+            has_text_input = True
+        elif isinstance(part, Image.Image): # PIL Image objesi
+            final_api_prompt_parts.append(part)
+        elif isinstance(part, dict) and "mime_type" in part and "data" in part: # Veri geldiğinde PIL'e çevir
+            try:
+                pil_image = Image.open(BytesIO(part["data"]))
+                final_api_prompt_parts.append(pil_image)
+            except Exception as e_pil:
+                logger.error(f"Multimodal için resim PIL Image'a çevrilirken hata: {e_pil}")
+                final_api_prompt_parts.append("(An image was provided but could not be processed.)")
+
+
+    if not has_text_input and any(isinstance(p, Image.Image) for p in final_api_prompt_parts):
+        # Sadece resim varsa ve kullanıcı metin girmemişse, varsayılan bir istem ekle
+        final_api_prompt_parts.append("Please describe or analyze the provided image(s).")
+
+    if len(final_api_prompt_parts) == 1 and final_api_prompt_parts[0] == personality_system_prompt:
+        # Sadece sistem promptu varsa (kullanıcıdan içerik gelmediyse)
+        return "It seems you didn't provide any content for me to process."
+
+
+    try:
+        # Loglama için prompt'un metin kısmını al
+        log_prompt_text_parts = [p for p in final_api_prompt_parts if isinstance(p, str)]
+        log_prompt_preview = " | ".join(log_prompt_text_parts)[:200]
+        logger.info(f"Gemini ({KULLANILACAK_GEMINI_MODELI}) Request (User: {user_id}, Lang: {target_language_code}, GuildPers: {apply_guild_chat_personality}, Premium: {user_is_premium}). Prompt Preview: {log_prompt_preview}...")
+
+        response = await asyncio.wait_for(
+            gemini_model_instance.generate_content_async(
+                final_api_prompt_parts,
+                safety_settings=current_safety_settings,
+                generation_config=DEFAULT_GENERATION_CONFIG
+            ),
+            timeout=90.0 # Multimodal için daha uzun timeout
+        )
+
+        if not response.parts:
+            block_reason = response.prompt_feedback.block_reason if response.prompt_feedback else "Unknown"
+            block_reason_name = getattr(block_reason, 'name', str(block_reason))
+            logger.warning(f"Gemini boş yanıt (User: {user_id}). Sebep: {block_reason_name}.")
+            if "SAFETY" in block_reason_name.upper():
+                return get_lang_string(user_id, "error_ai_safety_filter")
+            return get_lang_string(user_id, "error_ai_no_response")
+
+        ai_text = response.text.strip()
+        # Yanıtların aşırı uzun olmasını engellemek için (kelime bazlı)
+        # max_words = 300 # İsteğe bağlı
+        # words = ai_text.split()
+        # if len(words) > max_words:
+        #     ai_text = " ".join(words[:max_words]) + "..."
+        #     logger.info(f"Gemini yanıtı {max_words} kelimeye kısaltıldı.")
+            
+        return ai_text
+
+    except asyncio.TimeoutError:
+        logger.warning(f"Gemini isteği zaman aşımına uğradı (User: {user_id}).")
+        return get_lang_string(user_id, "error_ai_timeout")
+    except Exception as e:
+        logger.error(f"Google Gemini API hatası (User: {user_id}): {e}", exc_info=True)
+        err_str = str(e).lower()
+        if "api key not valid" in err_str: return get_lang_string(user_id, "error_ai_invalid_key")
+        elif "blocked" in err_str or "safety" in err_str: return get_lang_string(user_id, "error_ai_safety_filter_generic")
+        elif "quota" in err_str or "rate limit" in err_str: return get_lang_string(user_id, "error_ai_quota_exceeded")
+        elif "resource_exhausted" in err_str or "model_not_found" in err_str:
+             return get_lang_string(user_id, "error_ai_model_issue", model_name=KULLANILACAK_GEMINI_MODELI)
+        elif "image" in err_str or "mime_type" in err_str or "unsupported" in err_str:
+             return get_lang_string(user_id, "error_ai_unsupported_image")
+        return get_lang_string(user_id, "error_ai_comms_failed", error_message=str(e)[:100])
+
+
+# --- Medya İşleme Yardımcı Fonksiyonları ---
+async def fetch_url_content(session: aiohttp.ClientSession, url: str):
+    """Bir URL'den içerik (metin ve resim URL'si) çekmeye çalışır."""
+    try:
+        async with session.get(url, timeout=10) as response:
+            if response.status == 200:
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "text/html" in content_type:
+                    html_content = await response.text()
+                    # Basit OpenGraph ve başlık/açıklama çıkarma
+                    title_match = re.search(r"<title>(.*?)</title>", html_content, re.IGNORECASE | re.DOTALL)
+                    og_title_match = re.search(r'<meta\s+(?:property|name)="og:title"\s+content="(.*?)"', html_content, re.IGNORECASE)
+                    og_desc_match = re.search(r'<meta\s+(?:property|name)="og:description"\s+content="(.*?)"', html_content, re.IGNORECASE)
+                    og_image_match = re.search(r'<meta\s+(?:property|name)="og:image"\s+content="(.*?)"', html_content, re.IGNORECASE)
+
+                    title = og_title_match.group(1) if og_title_match else (title_match.group(1) if title_match else "No Title")
+                    description = og_desc_match.group(1) if og_desc_match else "No Description"
+                    image_url = og_image_match.group(1) if og_image_match else None
+                    
+                    # Metin içeriğini daha iyi çıkarmak için kütüphane gerekebilir (örn: newspaper3k, beautifulsoup4)
+                    # Şimdilik basit bir başlık + açıklama dönelim
+                    text_content = f"Title: {title.strip()}\nDescription: {description.strip()}"
+                    return {"text": text_content, "image_url": image_url}
+                elif content_type.startswith("image/"):
+                    image_bytes = await response.read()
+                    return {"image_bytes": image_bytes, "mime_type": content_type}
+                # Diğer içerik türleri için de genişletilebilir (JSON, TXT vb.)
+    except asyncio.TimeoutError:
+        logger.warning(f"URL getirme zaman aşımı: {url}")
+    except Exception as e:
+        logger.error(f"URL içeriği alınırken hata ({url}): {e}")
+    return None
+
+async def extract_text_from_pdf_bytes(pdf_bytes: bytes, user_id: int) -> str | None:
+    if PdfReader is None:
+        logger.error("PDF işleme için pypdf2 kütüphanesi kurulu değil.")
+        return get_lang_string(user_id, "error_pdf_library_missing")
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return text.strip()
+    except Exception as e:
+        logger.error(f"PDF'ten metin çıkarılırken hata: {e}")
+        return None # Hata durumunda None dön, komut içinde kullanıcıya mesaj verilsin
+
+async def process_message_for_ai_input(message: discord.Message, user_id_for_lang: int) -> tuple[list, str | None]:
+    """
+    Bir mesajı (ve yanıtladığı mesajı) işleyerek AI'a gönderilecek metin ve görsel parçalarını çıkarır.
+    Returns: tuple (prompt_parts_list, error_message_key_or_None)
+    prompt_parts_list: String ve PIL.Image objeleri içerebilir.
+    """
+    prompt_parts = []
+    attachments_processed_for_multimodal = False
+    MAX_FILE_SIZE_MB = 8 # Gemini için daha büyük olabilir, güvenli bir limit
+    MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+    async def process_single_message_content(msg_obj: discord.Message):
+        nonlocal attachments_processed_for_multimodal
+        # 1. Mesajın kendi metni
+        if msg_obj.content:
+            # Linkleri işle
+            url_pattern = r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+            urls_found = re.findall(url_pattern, msg_obj.content)
+            processed_content = msg_obj.content
+
+            async with aiohttp.ClientSession() as session:
+                for url in urls_found:
+                    logger.info(f"İşleniyor URL: {url}")
+                    url_data = await fetch_url_content(session, url)
+                    if url_data:
+                        if "text" in url_data:
+                            prompt_parts.append(f"\n--- Link Content ({url}) ---\n{url_data['text']}\n--- End Link Content ---")
+                        if "image_url" in url_data and url_data["image_url"]:
+                            # Linkten gelen resmi de indirip AI'a gönderme
+                            img_link_data = await fetch_url_content(session, url_data["image_url"])
+                            if img_link_data and "image_bytes" in img_link_data:
+                                try:
+                                    pil_image = Image.open(BytesIO(img_link_data["image_bytes"]))
+                                    prompt_parts.append(pil_image)
+                                    attachments_processed_for_multimodal = True
+                                except Exception as e_pil:
+                                    logger.error(f"URL'den gelen resim PIL'e çevrilirken hata: {e_pil}")
+                        elif "image_bytes" in url_data: # Doğrudan resim linki ise
+                             try:
+                                pil_image = Image.open(BytesIO(url_data["image_bytes"]))
+                                prompt_parts.append(pil_image)
+                                attachments_processed_for_multimodal = True
+                             except Exception as e_pil:
+                                logger.error(f"Doğrudan resim linki PIL'e çevrilirken hata: {e_pil}")
+                    # İşlenmiş linki metinden çıkarmak yerine olduğu gibi bırakabiliriz, AI'ın bağlamı anlamasına yardımcı olur.
+                    # processed_content = processed_content.replace(url, f"[{url_data['text'][:50]}... (link)]" if url_data and 'text' in url_data else f"[{url} (link)]")
+            
+            if processed_content.strip():
+                 prompt_parts.append(processed_content.strip())
+
+
+        # 2. Embed'ler
+        for embed in msg_obj.embeds:
+            embed_text_parts = []
+            if embed.title: embed_text_parts.append(f"Embed Title: {embed.title}")
+            if embed.description: embed_text_parts.append(f"Embed Description: {embed.description}")
+            for field in embed.fields:
+                embed_text_parts.append(f"Embed Field ({field.name}): {field.value}")
+            if embed.footer and embed.footer.text: embed_text_parts.append(f"Embed Footer: {embed.footer.text}")
+            if embed.author and embed.author.name: embed_text_parts.append(f"Embed Author: {embed.author.name}")
+            
+            if embed_text_parts:
+                prompt_parts.append(f"\n--- Embed Content ---\n" + "\n".join(embed_text_parts) + "\n--- End Embed Content ---")
+
+            if embed.image and embed.image.url:
+                try:
+                    async with aiohttp.ClientSession() as session, session.get(embed.image.url) as resp:
+                        if resp.status == 200 and resp.content_length < MAX_FILE_SIZE_BYTES:
+                            image_bytes = await resp.read()
+                            pil_image = Image.open(BytesIO(image_bytes))
+                            prompt_parts.append(pil_image)
+                            attachments_processed_for_multimodal = True
+                        elif resp.content_length >= MAX_FILE_SIZE_BYTES:
+                             logger.warning(f"Embed resmi çok büyük: {embed.image.url}")
+                             prompt_parts.append(f"[Embed Image (Too Large): {embed.image.url}]")
+                except Exception as e:
+                    logger.error(f"Embed resmi işlenirken hata ({embed.image.url}): {e}")
+                    prompt_parts.append(f"[Embed Image (Error): {embed.image.url}]")
+            
+            if embed.thumbnail and embed.thumbnail.url: # Thumbnail'ı da benzer şekilde işle
+                try:
+                    async with aiohttp.ClientSession() as session, session.get(embed.thumbnail.url) as resp:
+                        if resp.status == 200 and resp.content_length < MAX_FILE_SIZE_BYTES:
+                            image_bytes = await resp.read()
+                            pil_image = Image.open(BytesIO(image_bytes))
+                            prompt_parts.append(pil_image)
+                            attachments_processed_for_multimodal = True
+                        elif resp.content_length >= MAX_FILE_SIZE_BYTES:
+                             logger.warning(f"Embed thumbnail resmi çok büyük: {embed.thumbnail.url}")
+                             prompt_parts.append(f"[Embed Thumbnail (Too Large): {embed.thumbnail.url}]")
+                except Exception as e:
+                    logger.error(f"Embed thumbnail resmi işlenirken hata ({embed.thumbnail.url}): {e}")
+                    prompt_parts.append(f"[Embed Thumbnail (Error): {embed.thumbnail.url}]")
+
+
+        # 3. Ekler (Attachments)
+        for attachment in msg_obj.attachments:
+            if attachment.size > MAX_FILE_SIZE_BYTES:
+                logger.warning(f"Ek çok büyük: {attachment.filename} ({attachment.size} bytes)")
+                prompt_parts.append(f"[{attachment.filename} (File Too Large)]")
+                continue
+
+            content_type = attachment.content_type.lower() if attachment.content_type else ""
+            
+            if content_type.startswith("image/"):
+                try:
+                    image_bytes = await attachment.read()
+                    pil_image = Image.open(BytesIO(image_bytes))
+                    prompt_parts.append(pil_image)
+                    attachments_processed_for_multimodal = True
+                except Exception as e:
+                    logger.error(f"Görsel eki işlenirken hata ({attachment.filename}): {e}")
+                    prompt_parts.append(f"[{attachment.filename} (Image Error)]")
+            elif content_type == "application/pdf" and PdfReader:
+                try:
+                    pdf_bytes = await attachment.read()
+                    pdf_text = await extract_text_from_pdf_bytes(pdf_bytes, user_id_for_lang)
+                    if pdf_text:
+                        prompt_parts.append(f"\n--- PDF Content ({attachment.filename}) ---\n{pdf_text[:3000]}...\n--- End PDF Content ---") # Limitle
+                    else:
+                        prompt_parts.append(f"[{attachment.filename} (Could not extract text from PDF)]")
+                except Exception as e:
+                    logger.error(f"PDF eki işlenirken hata ({attachment.filename}): {e}")
+                    prompt_parts.append(f"[{attachment.filename} (PDF Error)]")
+            elif content_type.startswith("text/plain"):
+                try:
+                    text_bytes = await attachment.read()
+                    text_content = text_bytes.decode("utf-8", errors="ignore") # En yaygın encoding
+                    prompt_parts.append(f"\n--- TXT Content ({attachment.filename}) ---\n{text_content[:3000]}...\n--- End TXT Content ---") # Limitle
+                except Exception as e:
+                    logger.error(f"TXT eki işlenirken hata ({attachment.filename}): {e}")
+                    prompt_parts.append(f"[{attachment.filename} (TXT Error)]")
+            elif content_type.startswith("video/") or content_type.startswith("audio/"):
+                 prompt_parts.append(f"[Attachment: {attachment.filename} (Video/Audio - Content not directly processed, URL: {attachment.url})]")
+            elif attachment.url: # Diğer dosya türleri için linkini ekle
+                 prompt_parts.append(f"[Attachment: {attachment.filename} (URL: {attachment.url})]")
+
+
+        # 4. Çıkartmalar (Stickers)
+        for sticker_item in msg_obj.stickers:
+            sticker_text = f"Sticker: {sticker_item.name}"
+            if sticker_item.format == discord.StickerFormatType.png or sticker_item.format == discord.StickerFormatType.apng:
+                try:
+                    async with aiohttp.ClientSession() as session, session.get(sticker_item.url) as resp:
+                        if resp.status == 200 and resp.content_length < MAX_FILE_SIZE_BYTES:
+                            image_bytes = await resp.read()
+                            pil_image = Image.open(BytesIO(image_bytes))
+                            prompt_parts.append(pil_image)
+                            attachments_processed_for_multimodal = True
+                            sticker_text += " (Image processed)"
+                        else:
+                             sticker_text += f" (Image too large or unavailable: {sticker_item.url})"
+                except Exception as e:
+                    logger.error(f"Çıkartma resmi işlenirken hata ({sticker_item.name}): {e}")
+                    sticker_text += f" (Image error: {sticker_item.url})"
+            elif sticker_item.format == discord.StickerFormatType.lottie and sticker_item.url: # Lottie için sadece bilgi
+                sticker_text += f" (Lottie animation - Content not directly processed, URL: {sticker_item.url})"
+            prompt_parts.append(f"\n--- Sticker Item ---\n{sticker_text}\n--- End Sticker Item ---")
+
+
+    # Ana mesajı işle
+    await process_single_message_content(message)
+
+    # Eğer bir mesaja yanıt veriyorsa, o mesajı da işle
+    if message.reference and message.reference.message_id:
+        try:
+            replied_to_message = await message.channel.fetch_message(message.reference.message_id)
+            if replied_to_message:
+                prompt_parts.append("\n--- Replying to Content ---")
+                await process_single_message_content(replied_to_message)
+                prompt_parts.append("--- End Replying to Content ---")
+        except discord.NotFound:
+            logger.warning(f"Yanıtlanan mesaj ({message.reference.message_id}) bulunamadı.")
+        except Exception as e_ref_proc:
+            logger.error(f"Yanıtlanan mesaj işlenirken hata: {e_ref_proc}")
+
+    # Prompt parçalarını temizle (boş stringleri kaldır)
+    cleaned_prompt_parts = [part for part in prompt_parts if (isinstance(part, str) and part.strip()) or isinstance(part, Image.Image)]
+    
+    return cleaned_prompt_parts, None # Şimdilik hata mesajı yok
+
+# --- Kredi ve Zamanlayıcı Fonksiyonları ---
+async def grant_credits_if_needed(user_id: int, amount: int, reason: str):
+    """ Belirli bir sebeple kredi verir ve kullanıcıyı bilgilendirir. """
+    udata = get_user_data_entry(user_id)
+    udata["credits"] += amount
+    save_json_data(USER_DATA_FILE, user_data)
+    logger.info(f"{amount} kredi verildi. Kullanıcı: {user_id}, Sebep: {reason}, Yeni Bakiye: {udata['credits']}")
+    
+    # Kullanıcıya DM ile veya komut kanalında bilgi verilebilir. Şimdilik log yeterli.
+    # try:
+    #     user_obj = await client.fetch_user(user_id)
+    #     if user_obj:
+    #         lang_msg = get_lang_string(user_id, "credits_granted_generic_dm", amount=amount, reason=reason, new_balance=udata['credits'])
+    #         await user_obj.send(lang_msg)
+    # except Exception as e:
+    #     logger.warning(f"Kredi verildi DM gönderilemedi ({user_id}): {e}")
+
+
+async def daily_credit_handler():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        now = datetime.now(timezone.utc)
+        for user_id_str, u_data in list(user_data.items()): # list() ile kopyala, iterasyon sırasında değişiklik yapılabilir
+            user_id = int(user_id_str)
+            last_daily_ts_str = u_data.get("last_daily_credit_timestamp")
+            grant_daily = False
+            if last_daily_ts_str:
+                try:
+                    last_daily_ts = datetime.fromisoformat(last_daily_ts_str)
+                    if now - last_daily_ts >= timedelta(hours=23, minutes=50): # Neredeyse 24 saat
+                        grant_daily = True
+                except ValueError:
+                    grant_daily = True # Geçersiz zaman damgası, yine de ver
+            else:
+                grant_daily = True # İlk defa alıyor
+
+            if grant_daily:
+                current_credits = u_data.get("credits", 0)
+                u_data["credits"] = current_credits + 10
+                u_data["last_daily_credit_timestamp"] = now.isoformat()
+                logger.info(f"Kullanıcı {user_id_str} için 10 günlük kredi verildi. Yeni bakiye: {u_data['credits']}")
+                # Kullanıcıya DM veya bir log kanalı aracılığıyla bilgi verilebilir.
+                # Şimdilik save_json_data yeterli.
+        
+        save_json_data(USER_DATA_FILE, user_data) # Her döngüde bir kez kaydet
+        await asyncio.sleep(60 * 30) # Her 30 dakikada bir kontrol et
+
+async def check_and_deduct_credits(interaction_or_message: Interaction | Message, command_name: str):
+    """
+    Kullanıcının kredisi olup olmadığını kontrol eder, varsa 1 düşer.
+    Returns: True (başarılı ve kredi düşüldü), False (yetersiz kredi veya premium).
+             None (AI komutu değil veya hata).
+    """
+    user = interaction_or_message.author if isinstance(interaction_or_message, Message) else interaction_or_message.user
+    if is_premium_user(user.id):
+        return True # Premium kullanıcılar kredi harcamaz
+
+    udata = get_user_data_entry(user.id)
+    if udata["credits"] > 0:
+        udata["credits"] -= 1
+        save_json_data(USER_DATA_FILE, user_data)
+        # Kullanıcıya bilgi mesajı (isteğe bağlı, çok sık olursa spam olabilir)
+        # try:
+        #     cost_msg = get_lang_string(user.id, "command_cost_message", user_credits=udata['credits'])
+        #     if isinstance(interaction_or_message, Interaction):
+        #         await interaction_or_message.followup.send(cost_msg, ephemeral=True)
+        #     else:
+        #         await interaction_or_message.channel.send(f"{user.mention}, {cost_msg}", delete_after=10)
+        # except: pass
+        return True
+    else:
+        # Kredi bitti mesajı
+        exhausted_msg = get_lang_string(user.id, "credits_exhausted_message")
+        if isinstance(interaction_or_message, Interaction):
+            if not interaction_or_message.response.is_done():
+                await interaction_or_message.response.send_message(exhausted_msg, ephemeral=True)
+            else:
+                await interaction_or_message.followup.send(exhausted_msg, ephemeral=True)
+        else: # Message objesi ise
+            await interaction_or_message.reply(exhausted_msg, mention_author=False)
+        return False
+
+
+# --- Bot Hazır Olduğunda ---
+@client.event
+async def on_ready():
+    global user_data, premium_users, language_strings, guild_personalities
+    logger.info(f'{BOT_NAME} ({client.user}) ({VERSION}) göreve hazır!')
+
+    # Veri dosyalarını yükle
+    user_data = load_json_data(USER_DATA_FILE, {})
+    premium_users = load_json_data(PREMIUM_DATA_FILE, {}) # Premium kullanıcı ID'lerini string olarak saklar
+    guild_personalities = load_json_data(GUILD_PERSONALITIES_FILE, {})
+    load_translations() # Dil stringlerini yükle
+
+    # Kullanılmayan kullanıcıları user_data'dan temizle (isteğe bağlı, performansı etkileyebilir)
+    # active_user_ids = set() # ... sunuculardaki üyelerden topla ...
+    # for uid_str in list(user_data.keys()):
+    #     if uid_str not in active_user_ids:
+    #         del user_data[uid_str]
+    # save_json_data(USER_DATA_FILE, user_data)
+
+    try:
+        synced_commands = await tree.sync()
+        logger.info(f"{len(synced_commands)} adet slash komutu senkronize edildi.")
+        for cmd in synced_commands:
+            logger.info(f"  -> Synced: /{cmd.name}")
+    except Exception as e:
+        logger.error(f"Slash komut senkronizasyon hatası: {e}")
+
+    await client.change_presence(activity=discord.Game(name=f"/help | {PREFIX}help"))
+
+    # Günlük kredi verme görevini başlat
+    client.loop.create_task(daily_credit_handler())
+
+    # FastAPI'yi arka planda çalıştır
+    def run_fastapi():
+        uvicorn.run(fastapi_app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), log_level="warning")
+    threading.Thread(target=run_fastapi, daemon=True).start()
+    logger.info("FastAPI web sunucusu arka planda başlatıldı.")
+
+# --- Ana Mesaj İşleyici (on_message) ---
+@client.event
+async def on_message(message: Message):
+    if message.author.bot or not message.guild:
+        return # Bot mesajlarını ve DM'leri şimdilik yoksay (DM'ler için ayrı mantık eklenebilir)
+
+    user_id = message.author.id
+    user_lang = get_user_data_entry(user_id).get("language", "en")
+
+    # 1. Bota Doğrudan Mention ile Sohbet
+    if client.user.mentioned_in(message) and not message.mention_everyone:
+        # Kendi komut yanıtına reply ise ve tekrar mention yoksa işlem yapma
+        if message.reference:
+            try:
+                replied_to = await message.channel.fetch_message(message.reference.message_id)
+                if replied_to.author == client.user:
+                    # Eğer botun bir komut yanıtına (veya genel bir mesajına) reply atılıyorsa
+                    # ve kullanıcı tekrar botu mentionlamıyorsa (sadece reply ise) bu bir sohbet devamı sayılmaz.
+                    # Ancak, kullanıcı botun yanıtına reply atıp aynı zamanda botu tekrar mention'larsa, bu sohbet devamı sayılır.
+                    # Bu kontrol, "bot kendi komut yanıtına reply atarsa cevap vermesin" mantığını da kapsar.
+                    # Eğer "bot hiç bir komutta tekrar yanıt vermesin" daha katıysa, o zaman bu if'i daha da sıkılaştırmak gerekir.
+                    # Mevcut durumda, eğer kullanıcı botun mesajına reply atıp @OmniVerseAI diye tekrar etiketlerse sohbet devam eder.
+                    # Sadece reply atarsa ve botun önceki mesajı bir komut yanıtı değilse (yani saf AI sohbetiyse) o zaman da devam eder.
+                    # Bu kısım biraz karmaşık, kullanıcı isteğine göre ayarlanacak.
+                    # Şimdilik: Eğer botun mesajına reply atılıyor VE tekrar mention yoksa, normal prefix komutlarına geç.
+                    # Eğer botun mesajına reply atılıyor VE tekrar mention VARSA, bu bir AI sohbet devamıdır.
+                    is_reply_to_bot_without_new_mention = (replied_to.author == client.user and not re.search(rf"<@!?{client.user.id}>", message.content))
+                    if is_reply_to_bot_without_new_mention:
+                        # Normal prefix komutlarını işlemesi için aşağıya düşmesine izin ver
+                        pass # Bu if'i atlayıp prefix kontrolüne geç
+                    else: # Ya yeni mention var ya da botun olmayan bir mesaja reply (bu durumda da AI sohbeti olabilir)
+                        # AI sohbeti devam edebilir.
+                        pass # Devam eden AI sohbeti için aşağıya akacak
+            except discord.NotFound:
+                pass # Yanıtlanan mesaj bulunamadı, yeni sohbet gibi davranılabilir
+
+        if not await check_and_deduct_credits(message, "ai_chat"):
+            return # Kredi yoksa veya bitti mesajı gönderildiyse çık
+
+        thinking_msg_key = "ai_thinking"
+        #thinking_message_content = get_lang_string(user_id, thinking_msg_key)
+        # if not is_premium_user(user_id): # Ücretsiz kullanıcıya gecikme bilgisini ekle
+        #     thinking_message_content += " " + get_lang_string(user_id, "ai_response_delayed_free", delay_seconds=3.5)
+        
+        # thinking_discord_msg = await message.reply(thinking_message_content, mention_author=False)
+        async with message.channel.typing(): # Typing göstergesi daha iyi
+            # Mevcut mesajdan ve yanıtladığı mesajdan AI için inputları çıkar
+            ai_prompt_parts, error_msg_key = await process_message_for_ai_input(message, user_id)
+            
+            if error_msg_key:
+                # await thinking_discord_msg.delete()
+                await message.reply(get_lang_string(user_id, error_msg_key), mention_author=False)
+                return
+
+            if not ai_prompt_parts:
+                # await thinking_discord_msg.delete()
+                await message.reply(get_lang_string(user_id, "error_ai_no_content_to_process"), mention_author=False)
+                return
+            
+            # Kişilik ayarlarını kontrol et (sadece doğrudan mention sohbetleri için)
+            guild_pers_data = get_guild_personality(message.guild.id)
+            apply_guild_pers = False
+            if guild_pers_data and guild_pers_data.get("active", False):
+                apply_guild_pers = True
+
+            ai_response = await ask_gemini_core(
+                ai_prompt_parts,
+                user_id=user_id,
+                target_language_code=user_lang,
+                apply_guild_chat_personality=apply_guild_pers,
+                guild_id=message.guild.id
+            )
+
+        # try: await thinking_discord_msg.delete()
+        # except discord.NotFound: pass
+
+        if ai_response:
+            # Yanıtı 2000 karakterlik parçalara böl
+            for chunk in [ai_response[i:i + 1990] for i in range(0, len(ai_response), 1990)]:
+                await message.reply(chunk, mention_author=False)
+        else: # ask_gemini_core zaten hata mesajı döndürmeli
+            await message.reply(get_lang_string(user_id, "error_ai_failed_to_respond"), mention_author=False)
+        return # Mention ile işlendi, prefix komutlarını kontrol etme
+
+
+    # 2. Prefix Komutları
+    if message.content.startswith(PREFIX):
+        # Komut yanıtına reply ise işlem yapma (yukarıdaki mention mantığı bunu zaten bir ölçüde engelliyor)
+        if message.reference:
+            try:
+                replied_to_prefix_check = await message.channel.fetch_message(message.reference.message_id)
+                if replied_to_prefix_check.author == client.user:
+                    # Eğer botun bir mesajına (özellikle komut yanıtına) sadece prefix ile yanıt veriliyorsa, bunu engelle.
+                    # Bu, "bot hiçbir komutta tekrar yanıt vermesin" kuralını destekler.
+                    is_command_response = False # Botun önceki mesajının bir komut yanıtı olup olmadığını anlamak zor.
+                                                # Şimdilik, botun herhangi bir mesajına prefix ile reply atılırsa işlem yapma.
+                    logger.debug(f"Prefix komutu botun mesajına yanıt olarak geldi, işlenmiyor: {message.content}")
+                    return
+            except discord.NotFound:
+                pass # Sorun yok, devam et.
+
+        # Komutları işle (buraya prefix tabanlı komutların mantığı gelecek)
+        # Örneğin:
+        # args = message.content[len(PREFIX):].strip().split()
+        # command = args.pop(0).lower()
+        # await handle_prefix_command(message, command, args) # Bu helper fonksiyonu tanımlamanız gerekir
+        
+        # Geçici olarak, prefix komutlarının slash komutlarına yönlendirildiğini belirten bir mesaj:
+        logger.info(f"Prefix komutu algılandı: {message.content}. Kullanıcıya slash komutu kullanması önerilecek.")
+        # await message.reply(
+        #     f"Hey {message.author.mention}! Prefix komutları yerine artık daha modern slash komutlarını (`/`) kullanıyoruz. "
+        #     f"Lütfen `/help` yazarak mevcut komutları incele.",
+        #     mention_author=False,
+        #     delete_after=20
+        # )
+        # Aslında, prefix komutları da slash komutlarıyla aynı işlevi görmeli.
+        # Bu yüzden, her slash komutu için bir prefix aliası da oluşturacağız.
+        # Bu, `on_message` içinde bir komut yönlendirici (router) gerektirir.
+        # Şimdilik bu kısmı basit tutuyorum, sadece logluyorum.
+        # İstek: "tüm komutlar hem / hem . ile çalışsın"
+        # Bu, her slash komutunun bir de prefix versiyonunun tanımlanması gerektiği anlamına gelir.
+        # Veya on_message içinde manuel bir dispatching mekanizması.
+
+        # Örnek prefix komut işleyici (her komut için ayrı if/elif bloğu)
+        full_command_str = message.content[len(PREFIX):].strip()
+        if not full_command_str: return
+        
+        command_parts = full_command_str.split()
+        command_name_prefix = command_parts[0].lower()
+        command_args_prefix = command_parts[1:]
+
+        # Komutları manuel olarak yönlendirelim
+        # Bu kısım, her slash komutu için bir prefix karşılığı gerektirecek ve çok uzayacak.
+        # Daha iyi bir yol, slash komut objelerini bir yerde saklayıp, isimle eşleştirip çağırmak olabilir.
+        # Şimdilik sadece birkaç örnek:
+        if command_name_prefix == "ping":
+            await message.reply(f"Pong! {round(client.latency * 1000)}ms", mention_author=False)
+        elif command_name_prefix == "summarize":
+            # Buraya /summarize komutunun mantığını çağıran bir yapı gelecek
+            # Bu, slash komut fonksiyonunu doğrudan çağırmak veya ortak bir işlev kullanmak anlamına gelir.
+            # Şimdilik placeholder:
+            await message.reply(f"Prefix `{command_name_prefix}` komutu algılandı. Bunun için slash komutunu kullanın.", mention_author=False)
+        # ... diğer prefix komutları ...
+        return # Prefix komutu işlendi veya yönlendirildi.
+
+# --- Slash Komutları ---
+
+# Yardımcı Fonksiyon: Interaction'dan dil kodunu al
+def get_user_lang_from_interaction(interaction: Interaction) -> str:
+    return get_user_data_entry(interaction.user.id).get("language", "en")
+
+# Komut: /ping
+@tree.command(name="ping", description="Shows the bot's latency.")
+async def ping_slash(interaction: Interaction):
+    user_lang = get_user_lang_from_interaction(interaction) # Örnek dil kullanımı
+    await interaction.response.send_message(f"Pong! {EMOJIS['success']} Latency: {round(client.latency * 1000)}ms")
+
+
+# Komut: /premium
+@tree.command(name="premium", description="Information about OmniVerse AI Premium.")
+async def premium_slash(interaction: Interaction):
+    user_lang = get_user_lang_from_interaction(interaction)
+    embed = Embed(
+        title=get_lang_string(user_id=interaction.user.id, key="premium_command_title"),
+        description=get_lang_string(user_id=interaction.user.id, key="premium_command_description"),
+        color=discord.Color.gold() # Premium rengi
+    )
+    if client.user.avatar:
+        embed.set_thumbnail(url=client.user.avatar.url)
+    embed.add_field(
+        name=EMOJIS['link'] + " " + get_lang_string(user_id=interaction.user.id, key="premium_command_link_text"),
+        value="[Your Premium Purchase Link Here - e.g., Patreon, Ko-fi]", # GERÇEK LİNKİNİZİ BURAYA EKLEYİN
+        inline=False
+    )
+    embed.set_footer(text=f"{BOT_NAME} v{VERSION}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# Komut: /language
+class LanguageSelect(ui.Select):
+    def __init__(self, user_id_for_lang_strings: int):
+        self.user_id_for_lang_strings = user_id_for_lang_strings
+        options = [
+            discord.SelectOption(label=lang_data["name"], value=lang_code, emoji=lang_data["flag"])
+            for lang_code, lang_data in SUPPORTED_LANGUAGES.items()
+        ]
+        super().__init__(placeholder=get_lang_string(user_id_for_lang_strings, "select_language_placeholder", default="Choose your language..."), min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: Interaction):
+        selected_lang_code = self.values[0]
+        udata = get_user_data_entry(interaction.user.id)
+        udata["language"] = selected_lang_code
+        save_json_data(USER_DATA_FILE, user_data)
+        
+        lang_name_display = SUPPORTED_LANGUAGES.get(selected_lang_code, {}).get("name", selected_lang_code)
+        await interaction.response.send_message(
+            get_lang_string(interaction.user.id, "language_set", language_name=lang_name_display),
+            ephemeral=True
+        )
+        # Menüyü kaldır
+        await interaction.edit_original_response(view=None)
+
+
+class LanguageView(ui.View):
+    def __init__(self, user_id_for_lang_strings: int, original_interaction_user_id: int):
+        super().__init__(timeout=180.0)
+        self.original_interaction_user_id = original_interaction_user_id
+        self.add_item(LanguageSelect(user_id_for_lang_strings))
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        # Sadece komutu başlatan kişi etkileşimde bulunabilir
+        if interaction.user.id != self.original_interaction_user_id:
+            await interaction.response.send_message(
+                get_lang_string(interaction.user.id, "error_not_your_interaction", default="This is not for you!"),
+                ephemeral=True
+            )
+            return False
+        return True
+    
+    async def on_timeout(self):
+        # Zaman aşımında mesajdan view'ı kaldır (eğer mesaj hala varsa)
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except discord.NotFound:
+                pass # Mesaj silinmiş olabilir
+            except Exception as e:
+                logger.warning(f"LanguageView on_timeout mesaj düzenleme hatası: {e}")
+        self.stop()
+
+@tree.command(
+    name="language",
+    description="Set your preferred language for bot responses.",
+    description_localizations=get_all_localized_descriptions("language") # Yerelleştirilmiş açıklamalar
+)
+async def language_slash(interaction: Interaction):
+    user_lang = get_user_lang_from_interaction(interaction) # Mevcut dil ayarını al
+    view = LanguageView(user_id_for_lang_strings=interaction.user.id, original_interaction_user_id=interaction.user.id)
+    
+    embed_desc = get_lang_string(interaction.user.id, "language_selection_embed_description", default="Please select your preferred language from the menu below. This will change the language of my responses to you.")
+    current_lang_name = SUPPORTED_LANGUAGES.get(user_lang, {}).get("name", user_lang)
+    embed_desc += f"\n\nYour current language is: **{current_lang_name}** {SUPPORTED_LANGUAGES.get(user_lang, {}).get('flag', '')}"
+
+    embed = Embed(
+        title=f"{EMOJIS['translate']} Language Selection",
+        description=embed_desc,
+        color=discord.Color.blue()
+    )
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    view.message = await interaction.original_response() # Mesajı sakla ki timeout'ta düzenlenebilsin
+
+
+# Komut: /editpersonality
+@tree.command(
+    name="editpersonality",
+    description="Edit the AI's personality for direct mentions in this server.",
+    description_localizations=get_all_localized_descriptions("editpersonality")
+)
+@app_commands.describe(
+    action="Enable, disable, or view the current personality.",
+    prompt="The personality prompt for the AI (if enabling/editing)."
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="Enable/Edit", value="enable"),
+    app_commands.Choice(name="Disable", value="disable"),
+    app_commands.Choice(name="View", value="view"),
+])
+@app_commands.checks.has_permissions(manage_guild=True) # Sadece sunucu yöneticileri
+async def editpersonality_slash(interaction: Interaction, action: str, prompt: str = None):
+    if not interaction.guild_id:
+        await interaction.response.send_message(get_lang_string(interaction.user.id, "error_guild_only_command", default="This command can only be used in a server."), ephemeral=True)
+        return
+
+    guild_id_str = str(interaction.guild_id)
+    current_personality = guild_personalities.get(guild_id_str, {"prompt": None, "active": False})
+
+    if action == "enable":
+        if not prompt or len(prompt) < 10:
+            await interaction.response.send_message(get_lang_string(interaction.user.id, "error_personality_prompt_too_short", default="Personality prompt must be at least 10 characters."), ephemeral=True)
+            return
+        if len(prompt) > 1500: # Makul bir limit
+            await interaction.response.send_message(get_lang_string(interaction.user.id, "error_personality_prompt_too_long", max_chars=1500, default="Personality prompt cannot exceed 1500 characters."), ephemeral=True)
+            return
+        
+        guild_personalities[guild_id_str] = {"prompt": prompt, "active": True}
+        save_json_data(GUILD_PERSONALITIES_FILE, guild_personalities)
+        logger.info(f"Guild {guild_id_str} personality enabled/updated by {interaction.user.id}. Prompt: {prompt[:50]}...")
+        await interaction.response.send_message(get_lang_string(interaction.user.id, "personality_set_success"), ephemeral=True)
+
+    elif action == "disable":
+        if current_personality["active"]:
+            guild_personalities[guild_id_str] = {"prompt": current_personality["prompt"], "active": False} # Prompt'u sakla ama deaktif et
+            save_json_data(GUILD_PERSONALITIES_FILE, guild_personalities)
+            logger.info(f"Guild {guild_id_str} personality disabled by {interaction.user.id}.")
+            await interaction.response.send_message(get_lang_string(interaction.user.id, "personality_disabled_success"), ephemeral=True)
+        else:
+            await interaction.response.send_message(get_lang_string(interaction.user.id, "personality_no_active"), ephemeral=True)
+            
+    elif action == "view":
+        if current_personality["active"] and current_personality["prompt"]:
+            embed = Embed(title=get_lang_string(interaction.user.id, "personality_view_title", default="Current Server AI Personality (for Mentions)"),
+                          description=f"```\n{current_personality['prompt']}\n```\nStatus: **Active**",
+                          color=discord.Color.purple())
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        elif current_personality["prompt"]: # Aktif değil ama prompt var
+             embed = Embed(title=get_lang_string(interaction.user.id, "personality_view_title_inactive", default="Stored Server AI Personality (Currently Inactive)"),
+                          description=f"```\n{current_personality['prompt']}\n```\nStatus: **Inactive**",
+                          color=discord.Color.orange())
+             await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(get_lang_string(interaction.user.id, "personality_no_active"), ephemeral=True)
+
+
+# --- AI Komutları ---
+async def handle_ai_command_interaction(
+    interaction: Interaction,
+    command_name_log: str, # Loglama için
+    prompt_parts_for_ai: list,
+    is_multimodal_capable_command: bool = True # Çoğu AI komutu multimodal olabilir
+):
+    """ Genel AI komutları için temel işleyici (kredi, AI çağrısı, yanıt) """
+    user_id = interaction.user.id
+    user_lang = get_user_lang_from_interaction(interaction)
+
+    if not await check_and_deduct_credits(interaction, command_name_log):
+        return # Kredi yok veya bitti mesajı zaten gönderildi
+
+    await interaction.response.defer(ephemeral=False) # Komutlar genelde public yanıt verir
+
+    thinking_msg_key = "ai_thinking"
+    thinking_message_content = get_lang_string(user_id, thinking_msg_key)
+    if not is_premium_user(user_id):
+        thinking_message_content += " " + get_lang_string(user_id, "ai_response_delayed_free", delay_seconds=3.5) # Gecikme bilgisi
+    
+    # Geçici "düşünüyor" mesajı göndermek yerine defer() yeterli olabilir, Discord kendisi gösterir.
+    # temp_thinking_msg = await interaction.followup.send(thinking_message_content)
+
+    # Kişilik: Bu tür komutlarda sunucu kişiliği uygulanMAmalı. Sadece mention sohbetlerinde.
+    ai_response = await ask_gemini_core(
+        prompt_parts_for_ai,
+        user_id=user_id,
+        target_language_code=user_lang,
+        apply_guild_chat_personality=False, # Komutlarda sunucu kişiliği yok
+        guild_id=interaction.guild_id
+    )
+
+    # if temp_thinking_msg:
+    #     try: await temp_thinking_msg.delete()
+    #     except: pass
+
+    if ai_response:
+        # Yanıtı 2000 karakterlik embed'lere böl (veya direkt mesaja)
+        # Şimdilik tek bir embed/mesajda yollayalım, gerekirse bölme eklenebilir.
+        # Eğer yanıt çok uzunsa Discord hata verecektir. ask_gemini_core'daki max_output_tokens bunu bir nebze önler.
+        response_embed = Embed(description=ai_response, color=discord.Color.og_blurple())
+        response_embed.set_author(name=f"{EMOJIS['ai']} OmniVerse AI Response", icon_url=client.user.avatar.url if client.user.avatar else None)
+        response_embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+        await interaction.followup.send(embed=response_embed)
+    else:
+        await interaction.followup.send(get_lang_string(user_id, "error_ai_failed_to_respond_command", default="AI could not generate a response for this command."))
+
+
+@tree.command(
+    name="summarize",
+    description="Summarizes text, links, or uploaded documents.",
+    description_localizations=get_all_localized_descriptions("summarize")
+)
+@app_commands.describe(
+    text_or_link="Text to summarize or a link to a webpage/document.",
+    file="Upload a file (PDF, TXT, image) to summarize."
+)
+async def summarize_slash(interaction: Interaction, text_or_link: str = None, file: Attachment = None):
+    user_id = interaction.user.id
+    prompt_parts = []
+    error_msg_key_summarize = None
+
+    if not text_or_link and not file:
+        await interaction.response.send_message(get_lang_string(user_id, "error_summarize_no_input", default="Please provide text, a link, or upload a file to summarize."), ephemeral=True)
+        return
+
+    # Geçici bir mesaj oluşturup AI için inputları oradan alalım
+    temp_message_content = text_or_link if text_or_link else ""
+    temp_attachments = [file] if file else []
+    
+    # Gerçek bir Message objesi oluşturmak yerine, içeriği doğrudan işleyelim.
+    # process_message_for_ai_input normalde Message objesi bekler.
+    # Bu yüzden manuel olarak AI'a gönderilecek parçaları oluşturalım.
+
+    if temp_message_content:
+        # Linkleri işle
+        url_pattern = r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+        urls_found = re.findall(url_pattern, temp_message_content)
+        async with aiohttp.ClientSession() as session:
+            for url in urls_found:
+                url_data = await fetch_url_content(session, url)
+                if url_data:
+                    if "text" in url_data: prompt_parts.append(f"\nContent from Link ({url}):\n{url_data['text']}\n")
+                    if "image_url" in url_data and url_data["image_url"]:
+                        img_link_data = await fetch_url_content(session, url_data["image_url"])
+                        if img_link_data and "image_bytes" in img_link_data:
+                            try: prompt_parts.append(Image.open(BytesIO(img_link_data["image_bytes"])))
+                            except: pass
+                    elif "image_bytes" in url_data: # Doğrudan resim linki
+                        try: prompt_parts.append(Image.open(BytesIO(url_data["image_bytes"])))
+                        except: pass
+        # Link dışındaki metni de ekle (eğer varsa)
+        non_link_text = re.sub(url_pattern, "", temp_message_content).strip()
+        if non_link_text:
+            prompt_parts.insert(0, non_link_text) # Kullanıcının girdiği metni başa al
+
+    if file:
+        MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024
+        if file.size > MAX_FILE_SIZE_BYTES:
+            await interaction.response.send_message(get_lang_string(user_id, "error_file_too_large", max_size_mb=8), ephemeral=True)
+            return
+        
+        file_bytes = await file.read()
+        content_type = file.content_type.lower() if file.content_type else ""
+
+        if content_type.startswith("image/"):
+            try: prompt_parts.append(Image.open(BytesIO(file_bytes)))
+            except: error_msg_key_summarize = "error_file_image_process"
+        elif content_type == "application/pdf" and PdfReader:
+            pdf_text = await extract_text_from_pdf_bytes(file_bytes, user_id)
+            if pdf_text: prompt_parts.append(f"\nContent from PDF ({file.filename}):\n{pdf_text}\n")
+            else: error_msg_key_summarize = "error_pdf_read"
+        elif content_type.startswith("text/plain"):
+            try: prompt_parts.append(f"\nContent from TXT ({file.filename}):\n{file_bytes.decode('utf-8', errors='ignore')}\n")
+            except: error_msg_key_summarize = "error_file_txt_read"
+        else:
+            error_msg_key_summarize = "error_unsupported_file_summarize"
+            # await interaction.response.send_message(get_lang_string(user_id, "error_unsupported_file", file_type=content_type), ephemeral=True)
+            # return
+
+    if error_msg_key_summarize:
+        await interaction.response.send_message(get_lang_string(user_id, error_msg_key_summarize), ephemeral=True)
+        return
+
+    if not prompt_parts:
+        await interaction.response.send_message(get_lang_string(user_id, "error_summarize_no_valid_content", default="No valid content found to summarize."), ephemeral=True)
+        return
+
+    # AI'a gönderilecek asıl prompt'u oluştur
+    summarize_instruction = get_lang_string(user_id, "ai_prompt_summarize_instruction", default="Please summarize the following content concisely:")
+    final_ai_prompt_parts = [summarize_instruction] + prompt_parts
+
+    await handle_ai_command_interaction(interaction, "summarize", final_ai_prompt_parts)
+
+
+@tree.command(
+    name="translate",
+    description="Translates text or content from images/links to a specified language.",
+    description_localizations=get_all_localized_descriptions("translate")
+)
+@app_commands.describe(
+    target_language="The language code to translate to (e.g., en, tr, fr).",
+    text_or_link="Text to translate or a link to content.",
+    file="Upload an image file containing text to translate."
+)
+@app_commands.choices(target_language=[
+    app_commands.Choice(name=f"{data['flag']} {data['name']}", value=code) for code, data in SUPPORTED_LANGUAGES.items()
+])
+async def translate_slash(interaction: Interaction, target_language: str, text_or_link: str = None, file: Attachment = None):
+    user_id = interaction.user.id
+    if not text_or_link and not file:
+        await interaction.response.send_message(get_lang_string(user_id, "error_translate_no_input", default="Please provide text, a link, or an image file to translate."), ephemeral=True)
+        return
+
+    prompt_parts_translate = []
+    error_msg_key_translate = None
+
+    # Metin veya link işleme (summarize'a benzer)
+    if text_or_link:
+        url_pattern = r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+"
+        urls_found = re.findall(url_pattern, text_or_link)
+        async with aiohttp.ClientSession() as session:
+            for url in urls_found:
+                url_data = await fetch_url_content(session, url)
+                if url_data:
+                    if "text" in url_data: prompt_parts_translate.append(f"\nContent from Link ({url}):\n{url_data['text']}\n")
+                    if "image_url" in url_data and url_data["image_url"]:
+                        img_link_data = await fetch_url_content(session, url_data["image_url"])
+                        if img_link_data and "image_bytes" in img_link_data:
+                            try: prompt_parts_translate.append(Image.open(BytesIO(img_link_data["image_bytes"])))
+                            except: pass
+                    elif "image_bytes" in url_data:
+                        try: prompt_parts_translate.append(Image.open(BytesIO(url_data["image_bytes"])))
+                        except: pass
+        non_link_text_tr = re.sub(url_pattern, "", text_or_link).strip()
+        if non_link_text_tr:
+            prompt_parts_translate.insert(0, non_link_text_tr)
+
+    # Dosya işleme (sadece resim)
+    if file:
+        MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024
+        if file.size > MAX_FILE_SIZE_BYTES:
+            await interaction.response.send_message(get_lang_string(user_id, "error_file_too_large", max_size_mb=8), ephemeral=True)
+            return
+        
+        content_type = file.content_type.lower() if file.content_type else ""
+        if content_type.startswith("image/"):
+            try:
+                file_bytes = await file.read()
+                prompt_parts_translate.append(Image.open(BytesIO(file_bytes)))
+            except:
+                error_msg_key_translate = "error_file_image_process"
+        else:
+            error_msg_key_translate = "error_unsupported_file_translate_image_only" # Çeviri için sadece resim dosyası destekleniyor
+
+    if error_msg_key_translate:
+        await interaction.response.send_message(get_lang_string(user_id, error_msg_key_translate), ephemeral=True)
+        return
+
+    if not prompt_parts_translate:
+        await interaction.response.send_message(get_lang_string(user_id, "error_translate_no_valid_content", default="No valid content found to translate."), ephemeral=True)
+        return
+
+    target_lang_name = SUPPORTED_LANGUAGES.get(target_language, {}).get("name", target_language)
+    translate_instruction = get_lang_string(user_id, "ai_prompt_translate_instruction", target_language_name=target_lang_name, target_language_code=target_language, default=f"Please translate the following content into {target_lang_name} (code: {target_language}). If there are images, translate any text found in them as well:")
+    final_ai_prompt_parts_tr = [translate_instruction] + prompt_parts_translate
+    
+    await handle_ai_command_interaction(interaction, "translate", final_ai_prompt_parts_tr)
+
+
+@tree.command(
+    name="analyzedocument",
+    description="Analyzes an uploaded document (PDF, TXT).",
+    description_localizations=get_all_localized_descriptions("analyzedocument")
+)
+@app_commands.describe(
+    file="The document file (PDF or TXT) to analyze.",
+    question="Optional: A specific question to ask about the document."
+)
+async def analyzedocument_slash(interaction: Interaction, file: Attachment, question: str = None):
+    user_id = interaction.user.id
+    MAX_FILE_SIZE_BYTES = 8 * 1024 * 1024 # PDF/TXT için de bir limit olmalı
+    if file.size > MAX_FILE_SIZE_BYTES:
+        await interaction.response.send_message(get_lang_string(user_id, "error_file_too_large", max_size_mb=8), ephemeral=True)
+        return
+
+    file_bytes = await file.read()
+    content_type = file.content_type.lower() if file.content_type else ""
+    doc_text_content = None
+    error_key_doc = None
+
+    if content_type == "application/pdf" and PdfReader:
+        doc_text_content = await extract_text_from_pdf_bytes(file_bytes, user_id)
+        if not doc_text_content: error_key_doc = "error_pdf_read"
+    elif content_type.startswith("text/plain"):
+        try:
+            doc_text_content = file_bytes.decode("utf-8", errors="ignore")
+        except:
+            error_key_doc = "error_file_txt_read"
+    else:
+        error_key_doc = "error_unsupported_file" # Genel desteklenmeyen dosya
+
+    if error_key_doc:
+        await interaction.response.send_message(get_lang_string(user_id, error_key_doc, file_type=content_type), ephemeral=True)
+        return
+    
+    if not doc_text_content or not doc_text_content.strip():
+        await interaction.response.send_message(get_lang_string(user_id, "error_document_no_text", filename=file.filename, default=f"Could not extract any text from the document: {file.filename}."), ephemeral=True)
+        return
+
+    # AI prompt'u
+    analyze_instruction_key = "ai_prompt_analyzedocument_instruction_no_q"
+    default_instruction_no_q = f"Please analyze the following document content from '{file.filename}':"
+    if question:
+        analyze_instruction_key = "ai_prompt_analyzedocument_instruction_with_q"
+        default_instruction_with_q = f"Please analyze the following document content from '{file.filename}' and answer this question: '{question}':"
+    
+    analyze_instruction = get_lang_string(user_id, analyze_instruction_key, filename=file.filename, question=question, default=default_instruction_with_q if question else default_instruction_no_q)
+
+    # Döküman metnini AI'ın işleyebileceği bir boyuta kırp (örn. ilk X karakter)
+    MAX_DOC_TEXT_FOR_AI = 100000 # Gemini için token limiti daha yüksek olabilir, güvenli bir karakter limiti
+    if len(doc_text_content) > MAX_DOC_TEXT_FOR_AI:
+        doc_text_content_for_ai = doc_text_content[:MAX_DOC_TEXT_FOR_AI] + "\n...(Document content truncated due to length)..."
+    else:
+        doc_text_content_for_ai = doc_text_content
+
+    final_ai_prompt_parts_doc = [analyze_instruction, doc_text_content_for_ai]
+    await handle_ai_command_interaction(interaction, "analyzedocument", final_ai_prompt_parts_doc, is_multimodal_capable_command=False) # Sadece metin
+
+
+@tree.command(
+    name="analyzechat",
+    description="Analyzes recent messages in the current channel.",
+    description_localizations=get_all_localized_descriptions("analyzechat")
+)
+@app_commands.describe(question="Optional: A specific question to ask about the chat.")
+async def analyzechat_slash(interaction: Interaction, question: str = None):
+    user_id = interaction.user.id
+    MESSAGE_SCAN_LIMIT = 250 # Kullanıcının istediği limit
+
+    await interaction.response.defer() # Bu işlem uzun sürebilir
+
+    chat_history_texts = []
+    try:
+        async for msg_hist in interaction.channel.history(limit=MESSAGE_SCAN_LIMIT, oldest_first=False): # En sondan başa doğru
+            if msg_hist.author.bot: continue # Bot mesajlarını atla
+            
+            text_entry = f"[{msg_hist.created_at.strftime('%Y-%m-%d %H:%M')}] {msg_hist.author.display_name}: {msg_hist.clean_content}"
+            # Eklentiler veya embedler hakkında bilgi eklenebilir, ama metin odaklı analiz için şimdilik sadece clean_content
+            if msg_hist.embeds: text_entry += " [has embeds]"
+            if msg_hist.attachments: text_entry += f" [{len(msg_hist.attachments)} attachments]"
+            chat_history_texts.append(text_entry)
+        chat_history_texts.reverse() # Kronolojik sıraya getir (eskiden yeniye)
+    except discord.Forbidden:
+        await interaction.followup.send(get_lang_string(user_id, "error_analyzechat_permission", channel_name=interaction.channel.mention, default=f"I don't have permission to read message history in {interaction.channel.mention}."), ephemeral=True)
+        return
+    except Exception as e:
+        logger.error(f"Sohbet geçmişi okunurken hata (/analyzechat): {e}")
+        await interaction.followup.send(get_lang_string(user_id, "error_analyzechat_read_failed", default="Failed to read chat history."), ephemeral=True)
+        return
+
+    if not chat_history_texts:
+        await interaction.followup.send(get_lang_string(user_id, "error_analyzechat_no_messages", limit=MESSAGE_SCAN_LIMIT, default=f"No recent messages found to analyze in the last {MESSAGE_SCAN_LIMIT} messages."), ephemeral=True)
+        return
+
+    full_chat_log = "\n".join(chat_history_texts)
+    
+    # AI prompt'u
+    analyze_chat_instruction_key = "ai_prompt_analyzechat_instruction_no_q"
+    default_chat_instr_no_q = "Please analyze the following chat conversation from this channel. Focus on main topics, discussion dynamics, and overall sentiment:"
+    if question:
+        analyze_chat_instruction_key = "ai_prompt_analyzechat_instruction_with_q"
+        default_chat_instr_with_q = f"Please analyze the following chat conversation from this channel and answer this question: '{question}':"
+    
+    chat_instruction = get_lang_string(user_id, analyze_chat_instruction_key, question=question, default=default_chat_instr_with_q if question else default_chat_instr_no_q)
+
+    # Sohbet logunu AI'ın işleyebileceği bir boyuta kırp
+    MAX_CHAT_LOG_FOR_AI = 100000
+    if len(full_chat_log) > MAX_CHAT_LOG_FOR_AI:
+        full_chat_log_for_ai = full_chat_log[-MAX_CHAT_LOG_FOR_AI:] + "\n...(Chat log truncated due to length)..." # Sondan kırp ki en yeni mesajlar kalsın
+    else:
+        full_chat_log_for_ai = full_chat_log
+        
+    final_ai_prompt_parts_chat = [chat_instruction, full_chat_log_for_ai]
+    await handle_ai_command_interaction(interaction, "analyzechat", final_ai_prompt_parts_chat, is_multimodal_capable_command=False)
+
+
+@tree.command(
+    name="analyzeuser",
+    description="Analyzes the recent chat messages of a user in the current channel.",
+    description_localizations=get_all_localized_descriptions("analyzeuser")
+)
+@app_commands.describe(
+    user_to_analyze="The user whose messages you want to analyze.",
+    question="Optional: A specific question to ask about the user's messages."
+)
+async def analyzeuser_slash(interaction: Interaction, user_to_analyze: discord.Member, question: str = None):
+    user_id = interaction.user.id
+    TARGET_USER_MESSAGE_LIMIT = 150 # Kullanıcının istediği limit
+    OVERALL_SCAN_LIMIT_FOR_USER = 2500 # Bu kadar mesaj içinde kullanıcının mesajlarını ara
+
+    if user_to_analyze.bot:
+        await interaction.response.send_message(get_lang_string(user_id, "error_analyzeuser_is_bot", default="Cannot analyze messages of a bot."), ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    user_messages_collected = []
+    try:
+        count = 0
+        async for msg_hist_u in interaction.channel.history(limit=OVERALL_SCAN_LIMIT_FOR_USER, oldest_first=False):
+            if msg_hist_u.author.id == user_to_analyze.id:
+                if msg_hist_u.clean_content: # Sadece metin içeren mesajları al
+                    text_entry_u = f"[{msg_hist_u.created_at.strftime('%Y-%m-%d %H:%M')}] {msg_hist_u.clean_content}"
+                    # Eklentiler/embedler de eklenebilir
+                    if msg_hist_u.embeds: text_entry_u += " [has embeds]"
+                    if msg_hist_u.attachments: text_entry_u += f" [{len(msg_hist_u.attachments)} attachments]"
+                    user_messages_collected.append(text_entry_u)
+                    count += 1
+                    if count >= TARGET_USER_MESSAGE_LIMIT:
+                        break
+        user_messages_collected.reverse() # Kronolojik
+    except discord.Forbidden:
+        await interaction.followup.send(get_lang_string(user_id, "error_analyzeuser_permission", channel_name=interaction.channel.mention, default=f"I don't have permission to read message history in {interaction.channel.mention}."), ephemeral=True)
+        return
+    except Exception as e:
+        logger.error(f"Kullanıcı mesajları okunurken hata (/analyzeuser): {e}")
+        await interaction.followup.send(get_lang_string(user_id, "error_analyzeuser_read_failed", default="Failed to read user's messages."), ephemeral=True)
+        return
+
+    if not user_messages_collected:
+        await interaction.followup.send(get_lang_string(user_id, "error_analyzeuser_no_messages", user_name=user_to_analyze.display_name, limit=TARGET_USER_MESSAGE_LIMIT, scan_limit=OVERALL_SCAN_LIMIT_FOR_USER, default=f"No recent text messages found from {user_to_analyze.display_name} to analyze in the last {TARGET_USER_MESSAGE_LIMIT} (scanned up to {OVERALL_SCAN_LIMIT_FOR_USER} channel messages)."), ephemeral=True)
+        return
+        
+    full_user_log = "\n".join(user_messages_collected)
+
+    # AI prompt'u
+    analyze_user_instr_key = "ai_prompt_analyzeuser_instruction_no_q"
+    default_user_instr_no_q = f"Please analyze the following messages from user '{user_to_analyze.display_name}'. Focus on their communication style, common topics, and general tone:"
+    if question:
+        analyze_user_instr_key = "ai_prompt_analyzeuser_instruction_with_q"
+        default_user_instr_with_q = f"Please analyze the following messages from user '{user_to_analyze.display_name}' and answer this question: '{question}':"
+
+    user_instr = get_lang_string(user_id, analyze_user_instr_key, user_name=user_to_analyze.display_name, question=question, default=default_user_instr_with_q if question else default_user_instr_no_q)
+    
+    MAX_USER_LOG_FOR_AI = 100000
+    if len(full_user_log) > MAX_USER_LOG_FOR_AI:
+        full_user_log_for_ai = full_user_log[:MAX_USER_LOG_FOR_AI] + "\n...(User message log truncated due to length)..." # Baştan kırp (en eski mesajlar)
+    else:
+        full_user_log_for_ai = full_user_log
+
+    final_ai_prompt_parts_user = [user_instr, full_user_log_for_ai]
+    await handle_ai_command_interaction(interaction, "analyzeuser", final_ai_prompt_parts_user, is_multimodal_capable_command=False)
+
+
+# --- Oyun Komutları ---
+# TicTacToe Oyunu
+class TicTacToeButton(ui.Button['TicTacToeView']):
+    def __init__(self, x: int, y: int, row: int):
+        super().__init__(style=ButtonStyle.secondary, label='\u200b', row=row) # Boşluk karakteri
+        self.x = x
+        self.y = y
+
+    async def callback(self, interaction: Interaction):
+        view: 'TicTacToeView' = self.view
+        if not view: return
+
+        if interaction.user.id != view.current_player_obj.id:
+            await interaction.response.send_message(get_lang_string(interaction.user.id, "tictactoe_not_your_turn", default="It's not your turn!"), ephemeral=True)
+            return
+
+        if view.board[self.y][self.x] != view.EMPTY_CELL:
+            await interaction.response.send_message(get_lang_string(interaction.user.id, "tictactoe_cell_taken", default="This cell is already taken!"), ephemeral=True)
+            return
+
+        if view.game_over:
+            await interaction.response.defer() # Oyun bittiyse bir şey yapma
+            return
+
+        view.board[self.y][self.x] = view.current_player_marker
+        self.label = "X" if view.current_player_marker == view.PLAYER_X_MARKER else "O"
+        self.style = ButtonStyle.success if view.current_player_marker == view.PLAYER_X_MARKER else ButtonStyle.danger
+        self.disabled = True
+        
+        winner = view.check_winner()
+        if winner is not None: # Kazanan var veya berabere
+            await view.end_game(interaction, winner)
+        else: # Oyun devam ediyor
+            view.switch_player()
+            await interaction.response.edit_message(embed=view.create_embed(), view=view)
+            # Eğer AI sırasıysa, AI hamlesini yap
+            if view.game_mode == "ai" and view.current_player_obj == client.user:
+                await view.ai_move(interaction)
+
+
+class TicTacToeView(ui.View):
+    EMPTY_CELL = 0
+    PLAYER_X_MARKER = 1 # Genellikle insan oyuncu 1
+    PLAYER_O_MARKER = 2 # İnsan oyuncu 2 veya AI
+
+    def __init__(self, interaction_user: discord.Member, opponent: discord.Member | None, game_mode: str): # game_mode: "user" veya "ai"
+        super().__init__(timeout=300.0) # 5 dakika timeout
+        self.interaction_user = interaction_user # Oyunu başlatan
+        self.opponent = opponent # Rakip (user modunda) veya None (AI modunda)
+        self.game_mode = game_mode
+        self.message: discord.Message | None = None
+
+        self.player_x: discord.Member = interaction_user
+        self.player_o: discord.Member | None = None # O ya AI ya da opponent olacak
+
+        if game_mode == "ai":
+            self.player_o = client.user # AI botun kendisi
+        else: # game_mode == "user"
+            self.player_o = opponent
+        
+        self.current_player_obj: discord.Member = self.player_x # X başlar
+        self.current_player_marker = self.PLAYER_X_MARKER
+        
+        self.board = [[self.EMPTY_CELL for _ in range(3)] for _ in range(3)]
+        self.game_over = False
+
+        # Butonları ekle
+        for y_coord in range(3):
+            for x_coord in range(3):
+                self.add_item(TicTacToeButton(x_coord, y_coord, row=y_coord))
+    
+    def create_embed(self) -> Embed:
+        title = f"{EMOJIS['game']} Tic-Tac-Toe: {self.player_x.display_name} (X) vs "
+        if self.game_mode == "ai":
+            title += f"{BOT_NAME} (O)"
+        else:
+            title += f"{self.player_o.display_name} (O)"
+        
+        description = ""
+        if self.game_over:
+            # Sonuç mesajı end_game içinde eklenecek
+            pass
+        else:
+            current_marker_char = "X" if self.current_player_marker == self.PLAYER_X_MARKER else "O"
+            description = f"Turn: **{self.current_player_obj.display_name}** ({current_marker_char})"
+
+        embed = Embed(title=title, description=description, color=discord.Color.blurple())
+        # Tahtayı da gösterebiliriz (isteğe bağlı)
+        # board_display = "\n".join([" ".join([("X" if cell == self.PLAYER_X_MARKER else ("O" if cell == self.PLAYER_O_MARKER else "⬜")) for cell in row]) for row in self.board])
+        # embed.add_field(name="Board", value=f"```\n{board_display}\n```", inline=False)
+        return embed
+
+    def check_winner(self):
+        # Satırları, sütunları ve köşegenleri kontrol et
+        lines = []
+        lines.extend(self.board) # Satırlar
+        lines.extend([[self.board[j][i] for j in range(3)] for i in range(3)]) # Sütunlar
+        lines.append([self.board[i][i] for i in range(3)]) # Ana köşegen
+        lines.append([self.board[i][2-i] for i in range(3)]) # Ters köşegen
+
+        for line in lines:
+            if line[0] == line[1] == line[2] != self.EMPTY_CELL:
+                return line[0] # Kazanan marker'ı döndür (1 veya 2)
+
+        # Beraberlik kontrolü (tüm hücreler doluysa)
+        if all(cell != self.EMPTY_CELL for row in self.board for cell in row):
+            return 3 # Berabere kodu
+        return None # Oyun devam ediyor
+
+    def switch_player(self):
+        if self.current_player_marker == self.PLAYER_X_MARKER:
+            self.current_player_obj = self.player_o
+            self.current_player_marker = self.PLAYER_O_MARKER
+        else:
+            self.current_player_obj = self.player_x
+            self.current_player_marker = self.PLAYER_X_MARKER
+            
+    async def ai_move(self, interaction_context: Interaction):
+        if self.game_over or self.current_player_obj != client.user:
+            return
+
+        await asyncio.sleep(random.uniform(0.5, 1.5)) # AI düşünme süresi
+
+        empty_cells = []
+        for r_idx, row in enumerate(self.board):
+            for c_idx, cell in enumerate(row):
+                if cell == self.EMPTY_CELL:
+                    empty_cells.append((r_idx, c_idx))
+        
+        if not empty_cells: return # Hamle yapacak yer yok (beraberlik durumu check_winner'da yakalanmalı)
+
+        # Basit AI: Rastgele boş bir hücre seç
+        # Daha gelişmiş AI için Minimax algoritması eklenebilir
+        ai_r, ai_c = random.choice(empty_cells)
+        
+        self.board[ai_r][ai_c] = self.PLAYER_O_MARKER # AI her zaman O olsun
+        
+        # Butonu güncelle
+        button_to_update: TicTacToeButton | None = None
+        for item in self.children:
+            if isinstance(item, TicTacToeButton) and item.x == ai_c and item.y == ai_r:
+                button_to_update = item
+                break
+        
+        if button_to_update:
+            button_to_update.label = "O"
+            button_to_update.style = ButtonStyle.danger
+            button_to_update.disabled = True
+
+        winner = self.check_winner()
+        if winner is not None:
+            await self.end_game(interaction_context, winner, ai_played_last=True)
+        else:
+            self.switch_player() # Sırayı insana geri ver
+            if self.message:
+                await self.message.edit(embed=self.create_embed(), view=self)
+            # Eğer interaction_context bir mesajın yanıtıysa (bu durumda AI hamlesi için değil)
+            # o zaman interaction_context.edit_original_response() kullanılabilir.
+            # Ancak AI hamlesi genellikle bir buton callback'i sonrası olacağı için message.edit daha doğru.
+
+
+    async def end_game(self, interaction: Interaction, winner_marker: int, ai_played_last: bool = False):
+        self.game_over = True
+        for item in self.children:
+            if isinstance(item, ui.Button):
+                item.disabled = True
+        
+        result_message = ""
+        winner_obj: discord.Member | None = None
+        won_against_ai = False
+
+        if winner_marker == self.PLAYER_X_MARKER: # X kazandı
+            winner_obj = self.player_x
+            result_message = f"{EMOJIS['party']} {self.player_x.mention} (X) wins!"
+            if self.game_mode == "ai": won_against_ai = True
+        elif winner_marker == self.PLAYER_O_MARKER: # O kazandı
+            winner_obj = self.player_o
+            if self.game_mode == "ai": # AI kazandı
+                result_message = f"{EMOJIS['ai']} {BOT_NAME} (O) wins!"
+            else: # Diğer kullanıcı kazandı
+                result_message = f"{EMOJIS['party']} {self.player_o.mention} (O) wins!"
+        elif winner_marker == 3: # Berabere
+            result_message = f"{EMOJIS['info']} It's a Tie!"
+        
+        if won_against_ai and winner_obj == self.interaction_user: # Oyunu başlatan AI'ı yendi
+            await grant_credits_if_needed(winner_obj.id, 1, "TicTacToe AI Win")
+            result_message += f"\n{get_lang_string(winner_obj.id, 'tictactoe_vs_ai_win')}"
+
+        final_embed = self.create_embed() # Başlığı ve mevcut durumu alır
+        final_embed.description = result_message # Açıklamayı sonuçla günceller
+        final_embed.color = discord.Color.green() if winner_obj else discord.Color.orange()
+
+        # Interaction yanıtlanmışsa edit, değilse response.
+        # Eğer AI son hamleyi yaptıysa, bu bir buton callback'i olmayabilir.
+        if not ai_played_last: # İnsan oyuncu son hamleyi yaptı
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(embed=final_embed, view=self)
+            elif self.message:
+                await self.message.edit(embed=final_embed, view=self)
+        elif self.message: # AI son hamleyi yaptı, self.message üzerinden güncelle
+            await self.message.edit(embed=final_embed, view=self)
+        
+        self.stop()
+
+    async def on_timeout(self):
+        if not self.game_over and self.message:
+            self.game_over = True
+            for item in self.children:
+                if isinstance(item, ui.Button): item.disabled = True
+            
+            timeout_embed = self.create_embed()
+            timeout_embed.description = get_lang_string(self.interaction_user.id, "tictactoe_timeout", default="Game timed out!")
+            timeout_embed.color = discord.Color.red()
+            try:
+                await self.message.edit(embed=timeout_embed, view=self)
+            except discord.NotFound: pass
+            except Exception as e_timeout: logger.warning(f"TicTacToe timeout mesajı düzenlenemedi: {e_timeout}")
+        self.stop()
+
+
+@tree.command(
+    name="tictactoe",
+    description="Play Tic-Tac-Toe against AI or another user.",
+    description_localizations=get_all_localized_descriptions("tictactoe")
+)
+@app_commands.describe(opponent="The user to play against (leave empty to play against AI).")
+async def tictactoe_slash(interaction: Interaction, opponent: discord.Member = None):
+    user_lang = get_user_lang_from_interaction(interaction)
+
+    if opponent and opponent.bot:
+        await interaction.response.send_message(get_lang_string(interaction.user.id, "tictactoe_opponent_is_bot", default="You cannot play Tic-Tac-Toe against another bot."), ephemeral=True)
+        return
+    if opponent and opponent == interaction.user:
+        await interaction.response.send_message(get_lang_string(interaction.user.id, "tictactoe_play_with_self", default="You cannot play Tic-Tac-Toe against yourself."), ephemeral=True)
+        return
+
+    game_mode = "ai" if opponent is None else "user"
+    
+    # Kredi kontrolü (sadece AI'a karşı oynanıyorsa, oyun başında değil, kazanırsa verilecek)
+    # Bu komutun kendisi kredi harcamamalı.
+
+    view = TicTacToeView(interaction.user, opponent, game_mode)
+    initial_embed = view.create_embed()
+    
+    content_msg = ""
+    if game_mode == "user" and opponent:
+        content_msg = get_lang_string(interaction.user.id, "tictactoe_challenge_user", opponent_mention=opponent.mention, challenger_mention=interaction.user.mention, default=f"{opponent.mention}, {interaction.user.mention} challenges you to a game of Tic-Tac-Toe!")
+    elif game_mode == "ai":
+        content_msg = get_lang_string(interaction.user.id, "tictactoe_challenge_ai", user_mention=interaction.user.mention, bot_name=BOT_NAME, default=f"{interaction.user.mention} is challenging {BOT_NAME} to a game of Tic-Tac-Toe!")
+
+    await interaction.response.send_message(content=content_msg, embed=initial_embed, view=view)
+    view.message = await interaction.original_response()
+
+
+# --- Komut Ağacı Hata Yakalayıcısı ---
+@tree.error
+async def on_app_command_error(interaction: Interaction, error: app_commands.AppCommandError):
+    user_id_for_error_lang = interaction.user.id if interaction.user else DEVELOPER_IDS[0] # Fallback
+    logger.error(f"Slash Komut Hatası: {interaction.command.name if interaction.command else 'Bilinmeyen Komut'} - Tür: {type(error).__name__} - Hata: {error}", exc_info=True)
+    
+    embed = Embed(title=f"{EMOJIS['error']} Command Error!", color=discord.Color.red(), timestamp=datetime.now(timezone.utc))
+    
+    if isinstance(error, app_commands.CommandNotFound):
+        embed.description = get_lang_string(user_id_for_error_lang, "error_command_not_found", default="Command not found.")
+    elif isinstance(error, app_commands.MissingPermissions):
+        embed.description = get_lang_string(user_id_for_error_lang, "error_no_permission")
+    elif isinstance(error, app_commands.BotMissingPermissions):
+        embed.description = get_lang_string(user_id_for_error_lang, "error_bot_no_permission", permissions=', '.join(error.missing_permissions))
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        embed.description = get_lang_string(user_id_for_error_lang, "error_cooldown", seconds=error.retry_after)
+    elif isinstance(error, app_commands.CheckFailure): # Genel check hatası
+        embed.description = get_lang_string(user_id_for_error_lang, "error_check_failure", default="You do not meet the conditions to use this command.")
+    # ... diğer özel hata türleri eklenebilir ...
+    else:
+        embed.description = get_lang_string(user_id_for_error_lang, "error_generic_command_processing", error_message=str(error), default=f"An unexpected error occurred while processing the command: `{str(error)}`")
+    
+    embed.set_footer(text=f"{BOT_NAME} v{VERSION}")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+    except Exception as e_err_send:
+        logger.error(f"Komut hata mesajı gönderilemedi: {e_err_send}")
+
+
+# --- Botu Başlatma ---
+if __name__ == "__main__":
+    DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+    if not DISCORD_TOKEN:
+        logger.critical("HATA: DISCORD_TOKEN ortam değişkeni ayarlanmamış!")
+    elif not GEMINI_API_KEY: # Sadece uyarı, AI özellikleri çalışmaz
+        logger.warning("UYARI: GEMINI_API_KEY ortam değişkeni ayarlanmamış! AI özellikleri devre dışı olacak.")
+
+    if DISCORD_TOKEN:
+        try:
+            client.run(DISCORD_TOKEN, log_handler=None) # Discord.py kendi log handler'ını kullanır
+        except discord.LoginFailure:
+            logger.critical("Discord tokeni geçersiz. Lütfen tokeninizi kontrol edin.")
+        except discord.PrivilegedIntentsRequired:
+             logger.critical("Yetkilendirilmiş Intent'ler (Privileged Intents) etkinleştirilmemiş. Lütfen Discord Developer Portal'dan botunuz için 'Presence Intent', 'Server Members Intent' ve 'Message Content Intent' ayarlarını açın.")
+        except Exception as e_run:
+            logger.critical(f"Bot başlatılırken kritik bir hata oluştu: {e_run}", exc_info=True)
